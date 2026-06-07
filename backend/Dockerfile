@@ -4,6 +4,7 @@ WORKDIR /app
 
 # Install AWS CLI and dependencies
 RUN apk add --no-cache \
+    aws-cli \
     python3 \
     py3-pip \
     groff \
@@ -13,11 +14,6 @@ RUN apk add --no-cache \
     git \
     unzip
 
-# Install AWS CLI v2 using official installer
-RUN curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
-    unzip -q awscliv2.zip && \
-    ./aws/install && \
-    rm -rf awscliv2.zip aws
 
 # Copy backend package files
 COPY package*.json ./
