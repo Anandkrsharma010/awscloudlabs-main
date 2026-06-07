@@ -1,0 +1,42 @@
+{
+  "name": "aws-labs-backend",
+  "version": "1.0.0",
+  "description": "AWS labs sandbox management and terminal server",
+  "main": "src/server.ts",
+  "scripts": {
+    "dev": "concurrently \"nodemon src/server.ts\" \"nodemon src/terminal-server.ts\"",
+    "dev:api": "nodemon src/server.ts",
+    "dev:terminal": "nodemon src/terminal-server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "test": "jest"
+  },
+  "dependencies": {
+    "aws-sdk": "^2.1500.0",
+    "axios": "^1.6.0",
+    "cors": "^2.8.6",
+    "cross-spawn": "^7.0.3",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-ws": "^5.0.2",
+    "ioredis": "^5.3.2",
+    "jsonwebtoken": "^9.0.2",
+    "uuid": "^9.0.1",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/cross-spawn": "^6.0.6",
+    "@types/express": "^4.17.21",
+    "@types/express-ws": "^3.0.6",
+    "@types/ioredis": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^20.10.0",
+    "@types/uuid": "^9.0.7",
+    "@types/ws": "^8.18.1",
+    "concurrently": "^8.2.2",
+    "nodemon": "^3.0.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}

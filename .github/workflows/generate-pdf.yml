@@ -1,0 +1,91 @@
+name: Generate PDF from Markdown
+
+on:
+  push:
+    paths:
+      - 'documentations/**/*.md'
+    branches: [main, master]
+  
+  workflow_dispatch:
+    inputs:
+      generation_scope:
+        description: 'Generation scope'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - specific
+      specific_files:
+        description: 'Specific files (comma-separated, e.g., documentations/QUICKSTART.md)'
+        required: false
+        type: string
+
+jobs:
+  generate-pdf:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Needed for git log/diff
+    
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pandoc texlive-xetex texlive-fonts-recommended texlive-latex-extra
+        pip install PyPDF2 reportlab pypandoc
+    
+    - name: Detect files and get commit author
+      id: detect
+      run: |
+        mkdir -p generated-pdfs
+        
+        echo "Event: ${{ github.event_name }}"
+        
+        if [ "${{ github.event_name }}" == "push" ]; then
+          # Get changed .md files from last commit
+          CHANGED_FILES=$(git diff --name-only HEAD~1 | grep '\.md$' | tr '\n' ',' | sed 's/,$//')
+          AUTHOR=$(git log -1 --pretty=format:'%an')
+        elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          if [ "${{ inputs.generation_scope }}" == "all" ]; then
+            CHANGED_FILES=$(find documentations -name "*.md" | tr '\n' ',' | sed 's/,$//')
+          else
+            CHANGED_FILES="${{ inputs.specific_files }}"
+          fi
+          AUTHOR="${{ github.actor }}"
+        else
+          CHANGED_FILES=""
+          AUTHOR="unknown"
+        fi
+        
+        echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+        echo "author=$AUTHOR" >> $GITHUB_OUTPUT
+        echo "Detected files: $CHANGED_FILES"
+        echo "Author: $AUTHOR"
+    
+    - name: Generate PDFs
+      run: |
+        python scripts/generate_pdfs.py \
+          --files "${{ steps.detect.outputs.files }}" \
+          --author "${{ steps.detect.outputs.author }}"
+    
+    - name: Commit generated PDFs
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add generated-pdfs/
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "chore: update generated PDFs by ${{ steps.detect.outputs.author }} (${{ steps.detect.outputs.files }})"
+          git push
+        fi

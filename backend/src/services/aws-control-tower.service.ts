@@ -1,0 +1,660 @@
+import AWS from "aws-sdk";
+import { v4 as uuidv4 } from "uuid";
+
+export interface SandboxAccount {
+  accountId: string;
+  accountName: string;
+  email: string;
+  iamUserId: string;
+  iamUserName: string;
+  iamAccessKeyId: string;
+  iamSecretAccessKey: string;
+  iamSessionToken?: string;
+  region: string;
+  createdAt: number;
+  expiresAt: number;
+  status: "creating" | "active" | "destroying" | "destroyed";
+}
+
+export interface LabSandboxConfig {
+  accountId: string;
+  region: string;
+  iamAccessKeyId: string;
+  iamSecretAccessKey: string;
+  labPermissions: string[];
+}
+
+export class AWSControlTowerService {
+  private organizations: AWS.Organizations;
+  private iam: AWS.IAM;
+  private managementAccountId: string;
+  private managementRole: string;
+  private region: string;
+  // The Labs account ID where roles can be assumed
+  private readonly LABS_ACCOUNT_ID = "766363046973";
+
+  constructor() {
+    this.managementAccountId = process.env.AWS_MANAGEMENT_ACCOUNT_ID || "";
+    this.managementRole = process.env.AWS_MANAGEMENT_ACCOUNT_ROLE_ARN || "";
+    // Default to ap-south-1 (Mumbai) for the CyberRange Lab environment
+    // This can be overridden by AWS_REGION env var
+    this.region = process.env.AWS_REGION || "ap-south-1";
+
+    console.log(`[AWSControlTower] Initialized with region: ${this.region}, NODE_ENV: ${process.env.NODE_ENV}`);
+
+    this.organizations = new AWS.Organizations({ region: this.region });
+    this.iam = new AWS.IAM({ region: this.region });
+  }
+
+  /**
+   * Get credentials by assuming the CyberRangeLabManagerRole
+   * Uses the Labs account role for all lab sessions
+   */
+  private async getLabsCredentials(labId: string, userId: string): Promise<{
+    accessKeyId: string;
+    secretAccessKey: string;
+    sessionToken: string;
+    expiration: Date;
+  }> {
+    const sts = new AWS.STS({ region: this.region });
+    
+    // Use the CyberRangeLabManagerRole for all lab sessions
+    const roleName = "CyberRangeLabManagerRole";
+    const roleArn = `arn:aws:iam::${this.LABS_ACCOUNT_ID}:role/${roleName}`;
+    
+    console.log(`[AWSControlTower] Assuming role: ${roleArn} in region ${this.region}`);
+    
+    try {
+      const response = await sts.assumeRole({
+        RoleArn: roleArn,
+        RoleSessionName: `lab-session-${userId}-${Date.now()}`,
+        DurationSeconds: 3600, // 1 hour
+      }).promise();
+      
+      if (!response.Credentials) {
+        throw new Error("Failed to get temporary credentials from STS");
+      }
+      
+      console.log(`[AWSControlTower] Successfully assumed role: ${roleName}`);
+      
+      return {
+        accessKeyId: response.Credentials.AccessKeyId,
+        secretAccessKey: response.Credentials.SecretAccessKey,
+        sessionToken: response.Credentials.SessionToken,
+        expiration: response.Credentials.Expiration,
+      };
+    } catch (error) {
+      console.error(`[AWSControlTower] Failed to assume role ${roleArn}:`, error);
+      throw new Error(`Failed to assume lab role: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Create a new sandbox AWS account
+   * Priority: Env vars > AWS SDK default credentials > Labs account > Dev mode (only in development)
+   */
+  async createSandboxAccount(userId: string, labId: string, region: string = "ap-south-1"): Promise<SandboxAccount> {
+    // Check if AWS credentials are provided in environment - use these FIRST
+    const awsAccessKeyId = process.env.AWS_ACCESS_KEY_ID;
+    const awsSecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+    const awsRegion = process.env.AWS_REGION || region;
+    
+    console.log(`[AWSControlTower] createSandboxAccount called - NODE_ENV: ${process.env.NODE_ENV}, hasAWSEnvCreds: ${!!(awsAccessKeyId && awsSecretAccessKey)}, AWS_ACCESS_KEY_ID: ${awsAccessKeyId ? awsAccessKeyId.substring(0, 4) + '****' : 'undefined'}`);
+    
+    // If AWS credentials are provided in environment, use them directly
+    if (awsAccessKeyId && awsSecretAccessKey) {
+      console.log(`[AWSControlTower] Using credentials from environment variables for lab: ${labId}`);
+      
+      // Check if these are temporary STS credentials (ASIA...)
+      const isStsCredential = awsAccessKeyId.startsWith("ASIA");
+      
+      const sandbox: SandboxAccount = {
+        accountId: "000000000000", // User's own account
+        accountName: `lab-${labId}-${userId}`,
+        email: "lab@sandbox.local",
+        iamUserId: "environment-user",
+        iamUserName: "environment-user",
+        iamAccessKeyId: awsAccessKeyId,
+        iamSecretAccessKey: awsSecretAccessKey,
+        iamSessionToken: isStsCredential ? process.env.AWS_SESSION_TOKEN : undefined,
+        region: awsRegion,
+        createdAt: Date.now(),
+        expiresAt: isStsCredential ? Date.now() + 60 * 60 * 1000 : Date.now() + 365 * 24 * 60 * 60 * 1000,
+        status: "active",
+      };
+      
+      console.log(`[AWSControlTower] Sandbox created with environment credentials (STS: ${isStsCredential})`);
+      return sandbox;
+    }
+    
+    // Check if we're in production mode (not development)
+    const isProduction = process.env.NODE_ENV === "production";
+    
+    // In production mode without env credentials, try to get credentials from AWS SDK default chain
+    if (isProduction) {
+      try {
+        console.log(`[AWSControlTower] Production mode: Trying to get credentials from AWS SDK default chain`);
+        
+        // Try to get credentials from AWS SDK default chain (instance role, EC2 metadata, etc.)
+        const sts = new AWS.STS({ region: this.region });
+        const identity = await sts.getCallerIdentity().promise();
+        
+        console.log(`[AWSControlTower] Got credentials from AWS SDK. Account: ${identity.Account}, UserId: ${identity.UserId}`);
+        
+        // Get temporary credentials using GetSessionToken for the current identity
+        const credentials = await sts.getSessionToken({
+          DurationSeconds: 3600,
+        }).promise();
+        
+        if (!credentials.Credentials) {
+          throw new Error("Failed to get session token");
+        }
+        
+        const sandbox: SandboxAccount = {
+          accountId: identity.Account || "unknown",
+          accountName: `lab-${labId}-${userId}`,
+          email: "lab@sandbox.local",
+          iamUserId: identity.UserId || "unknown",
+          iamUserName: identity.Arn?.split('/').pop() || "unknown",
+          iamAccessKeyId: credentials.Credentials.AccessKeyId,
+          iamSecretAccessKey: credentials.Credentials.SecretAccessKey,
+          iamSessionToken: credentials.Credentials.SessionToken,
+          region: awsRegion,
+          createdAt: Date.now(),
+          expiresAt: credentials.Credentials.Expiration.getTime(),
+          status: "active",
+        };
+        
+        console.log(`[AWSControlTower] Sandbox created with SDK default credentials (expires: ${credentials.Credentials.Expiration})`);
+        return sandbox;
+      } catch (sdkError) {
+        console.error("[AWSControlTower] Failed to get credentials from SDK default chain:", sdkError);
+        
+        // Try Labs account as fallback
+        try {
+          console.log(`[AWSControlTower] Trying Labs account as fallback`);
+          const credentials = await this.getLabsCredentials(labId, userId);
+          
+          const sandbox: SandboxAccount = {
+            accountId: this.LABS_ACCOUNT_ID,
+            accountName: `lab-${labId}-${userId}`,
+            email: "lab@sandbox.local",
+            iamUserId: "lab-role",
+            iamUserName: this.getLabRoleName(labId),
+            iamAccessKeyId: credentials.accessKeyId,
+            iamSecretAccessKey: credentials.secretAccessKey,
+            iamSessionToken: credentials.sessionToken,
+            region: region,
+            createdAt: Date.now(),
+            expiresAt: credentials.expiration.getTime(),
+            status: "active",
+          };
+          
+          console.log(`[AWSControlTower] Sandbox created with assumed role credentials (expires: ${credentials.expiration})`);
+          return sandbox;
+        } catch (labsError) {
+          console.error("[AWSControlTower] Failed to create sandbox with Labs account:", labsError);
+          
+          // In production, throw error - can't use mock credentials
+          const errorMessage = labsError instanceof Error ? labsError.message : 'Unknown error';
+          throw new Error(
+            `Failed to create lab session: ${errorMessage}\n\n` +
+            `To use this feature with real AWS access, you need to:\n` +
+            `Option 1 (Recommended): Set these environment variables:\n` +
+            `  - AWS_ACCESS_KEY_ID=your_access_key\n` +
+            `  - AWS_SECRET_ACCESS_KEY=your_secret_key\n` +
+            `  - AWS_REGION=us-east-1\n\n` +
+            `Option 2: Set up an AWS Labs account with ID: ${this.LABS_ACCOUNT_ID}\n` +
+            `  - Create IAM roles for each lab type (Labs-S3-Admin, Labs-IAM-Admin, etc.)\n` +
+            `  - Configure cross-account access from your backend account`
+          );
+        }
+      }
+    }
+    
+    // Development mode - try Labs account first, fall back to DEVKEY if that fails
+    try {
+      console.log(`[AWSControlTower] Development mode: Creating sandbox for lab: ${labId}, user: ${userId}`);
+      
+      // Try to get Labs credentials first
+      const credentials = await this.getLabsCredentials(labId, userId);
+      
+      const sandbox: SandboxAccount = {
+        accountId: this.LABS_ACCOUNT_ID,
+        accountName: `lab-${labId}-${userId}`,
+        email: "lab@sandbox.local",
+        iamUserId: "lab-role",
+        iamUserName: this.getLabRoleName(labId),
+        iamAccessKeyId: credentials.accessKeyId,
+        iamSecretAccessKey: credentials.secretAccessKey,
+        iamSessionToken: credentials.sessionToken,
+        region: region,
+        createdAt: Date.now(),
+        expiresAt: credentials.expiration.getTime(),
+        status: "active",
+      };
+      
+      console.log(`[AWSControlTower] Sandbox created with assumed role credentials (expires: ${credentials.expiration})`);
+      return sandbox;
+    } catch (error) {
+      // In development mode, fall back to DEVKEY if Labs account fails
+      console.warn(`[AWSControlTower] Failed to get Labs credentials, using DEVKEY (development mode):`, error);
+      
+      return {
+        accountId: "000000000000",
+        accountName: `lab-${labId}-${userId}-dev`,
+        email: "dev@sandbox.local",
+        iamUserId: "dev-user",
+        iamUserName: "dev-user",
+        iamAccessKeyId: "DEVKEY",
+        iamSecretAccessKey: "DEVSECRET",
+        region: region,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 2 * 60 * 60 * 1000, // 2 hours
+        status: "active",
+      };
+    }
+  }
+
+  /**
+   * Create IAM user with lab-specific permissions
+   */
+  private async createLabIAMUser(
+    accountId: string,
+    userId: string,
+    labId: string
+  ): Promise<{
+    iamUserId: string;
+    userName: string;
+    accessKeyId: string;
+    secretAccessKey: string;
+  }> {
+    try {
+      const userName = `lab-user-${userId}-${Date.now()}`;
+
+      // In production, assume role in sandbox account:
+      // const credentials = await this.assumeRoleInAccount(accountId);
+      // const iamInSandbox = new AWS.IAM({ credentials });
+
+      console.log(`[AWSControlTower] Creating IAM user: ${userName}`);
+
+      // Create user (using management account IAM for demo)
+      const createUserResponse = await this.iam
+        .createUser({
+          UserName: userName,
+          Tags: [
+            {
+              Key: 'Owner',
+              Value: process.env.IAM_USERNAME || 'lab-admin'
+            }
+          ]
+        })
+        .promise();
+
+      const userIdResponse = createUserResponse.User?.UserId || uuidv4();
+
+      // Attach lab-specific policy
+      const policyName = `lab-${labId}-policy-${Date.now()}`;
+      const policyDocument = this.getLabPolicy(labId);
+
+      await this.iam
+        .putUserPolicy({
+          UserName: userName,
+          PolicyName: policyName,
+          PolicyDocument: JSON.stringify(policyDocument),
+        })
+        .promise();
+
+      // Create access key
+      const accessKeyResponse = await this.iam
+        .createAccessKey({ UserName: userName })
+        .promise();
+
+      const accessKey = accessKeyResponse.AccessKey;
+
+      if (!accessKey?.AccessKeyId || !accessKey?.SecretAccessKey) {
+        throw new Error("Failed to create access key - keys were not returned from AWS");
+      }
+
+      // Validate the created access key by attempting to use it
+      console.log(`[AWSControlTower] Validating created access keys for user: ${userName}`);
+      await this.validateAccessKey(
+        accessKey.AccessKeyId,
+        accessKey.SecretAccessKey
+      );
+
+      return {
+        iamUserId: userIdResponse,
+        userName,
+        accessKeyId: accessKey.AccessKeyId,
+        secretAccessKey: accessKey.SecretAccessKey,
+      };
+    } catch (error) {
+      console.error("[AWSControlTower] Failed to create IAM user:", error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to create IAM user: ${errorMessage}`);
+    }
+  }
+
+  /**
+   * Validate that access keys are actually working
+   */
+  private async validateAccessKey(
+    accessKeyId: string,
+    secretAccessKey: string
+  ): Promise<void> {
+    try {
+      const sts = new AWS.STS({
+        accessKeyId,  
+        secretAccessKey,
+        region: this.region,
+      });
+
+      console.log("[AWSControlTower] Testing access key with STS GetCallerIdentity...");
+      const result = await sts.getCallerIdentity().promise();
+      console.log(
+        `[AWSControlTower] Access key validated. Account: ${result.Account}, UserId: ${result.UserId}`
+      );
+    } catch (error: any) {
+      const errorMessage = error?.message || String(error);
+      console.error(
+        "[AWSControlTower] Access key validation failed:",
+        errorMessage
+      );
+
+      if (
+        errorMessage?.includes("security token") ||
+        errorMessage?.includes("InvalidClientTokenId")
+      ) {
+        throw new Error(
+          "Created access key is invalid. The AWS credentials are not working properly."
+        );
+      }
+
+      throw new Error(`Access key validation failed: ${errorMessage}`);
+    }
+  }
+
+  /**
+   * Get lab-specific IAM policy based on lab type
+   */
+  private getLabPolicy(labId: string): Record<string, unknown> {
+    const policies: Record<string, Record<string, unknown>> = {
+      "lab-1-s3": {
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Effect: "Allow",
+            Action: ["s3:*"],
+            Resource: ["arn:aws:s3:::lab-*"],
+          },
+          {
+            Effect: "Allow",
+            Action: ["s3:ListAllMyBuckets"],
+            Resource: "*",
+          },
+        ],
+      },
+      "lab-2-iam": {
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Effect: "Allow",
+            Action: [
+              "iam:GetUser",
+              "iam:ListUsers",
+              "iam:GetRole",
+              "iam:ListRoles",
+              "iam:GetPolicy",
+              "iam:ListPolicies",
+              "iam:AttachUserPolicy",
+              "iam:PutUserPolicy",
+            ],
+            Resource: "*",
+          },
+        ],
+      },
+      "lab-3-ec2": {
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Effect: "Allow",
+            Action: [
+              "ec2:DescribeInstances",
+              "ec2:DescribeSecurityGroups",
+              "ec2:AuthorizeSecurityGroupIngress",
+              "ec2:RevokeSecurityGroupIngress",
+              "ec2:CreateSecurityGroup",
+              "ec2:DescribeVpcs",
+            ],
+            Resource: "*",
+          },
+        ],
+      },
+      "lab-4-lambda": {
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Effect: "Allow",
+            Action: [
+              "lambda:ListFunctions",
+              "lambda:GetFunction",
+              "lambda:GetFunctionConfiguration",
+              "lambda:ListLayers",
+              "lambda:GetLayerVersion",
+            ],
+            Resource: "*",
+          },
+        ],
+      },
+      "lab-5-dynamodb": {
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Effect: "Allow",
+            Action: [
+              "dynamodb:ListTables",
+              "dynamodb:DescribeTable",
+              "dynamodb:Scan",
+              "dynamodb:Query",
+              "dynamodb:GetItem",
+              "dynamodb:BatchGetItem",
+            ],
+            Resource: ["arn:aws:dynamodb:*:*:table/lab-*"],
+          },
+        ],
+      },
+      "lab-6-cloudtrail": {
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Effect: "Allow",
+            Action: [
+              "cloudtrail:LookupEvents",
+              "cloudtrail:DescribeTrails",
+              "cloudtrail:GetTrailStatus",
+            ],
+            Resource: "*",
+          },
+        ],
+      },
+      "lab-7-ssm": {
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Effect: "Allow",
+            Action: [
+              "ssm:DescribeInstanceInformation",
+              "ssm:GetCommandInvocation",
+              "ssm:ListCommandInvocations",
+              "ssm:SendCommand",
+              "ssm:StartSession",
+            ],
+            Resource: "*",
+          },
+        ],
+      },
+    };
+
+    return policies[labId] || policies["lab-1-s3"];
+  }
+
+  /**
+   * Destroy sandbox account
+   */
+  async destroySandboxAccount(accountId: string, iamUserName?: string): Promise<void> {
+    try {
+      console.log(`[AWSControlTower] Destroying account: ${accountId}`);
+
+      // Delete IAM user and all associated resources (if it exists)
+      if (iamUserName) {
+        try {
+          await this.deleteIAMUser(iamUserName);
+        } catch (iamError: any) {
+          // If the user doesn't exist, just log and continue - this is not a fatal error
+          if (iamError.code === 'NoSuchEntity' || iamError.code === 'ResourceNotFoundException') {
+            console.log(`[AWSControlTower] IAM user ${iamUserName} does not exist, skipping cleanup`);
+          } else {
+            // For other errors, log but don't fail the session destruction
+            console.warn(`[AWSControlTower] Warning: Failed to delete IAM user ${iamUserName}:`, iamError.message);
+          }
+        }
+      }
+
+      // In production, close the AWS account
+      // This typically requires:
+      // 1. Remove organization policies
+      // 2. Close/disable the account
+      // 3. Archive resources
+
+      // For demo, just log
+      console.log(
+        `[AWSControlTower] Account ${accountId} marked for deletion`
+      );
+    } catch (error) {
+      console.error("[AWSControlTower] Failed to destroy account:", error);
+      // Don't throw - session cleanup should succeed even if AWS cleanup fails
+      console.log(`[AWSControlTower] Session cleanup completed (with warnings)`);
+    }
+  }
+
+  /**
+   * Delete IAM user and all associated resources
+   */
+  private async deleteIAMUser(userName: string): Promise<void> {
+    try {
+      console.log(`[AWSControlTower] Deleting IAM user: ${userName}`);
+
+      // First check if user exists
+      try {
+        await this.iam.getUser({ UserName: userName }).promise();
+      } catch (getUserError: any) {
+        // If user doesn't exist, just log and return
+        if (getUserError.code === 'NoSuchEntity' || getUserError.code === 'ResourceNotFoundException') {
+          console.log(`[AWSControlTower] IAM user ${userName} does not exist, skipping deletion`);
+          return;
+        }
+        // For other errors, re-throw
+        throw getUserError;
+      }
+
+      // Detach all policies
+      const attachedPolicies = await this.iam.listAttachedUserPolicies({ UserName: userName }).promise();
+      for (const policy of attachedPolicies.AttachedPolicies || []) {
+        try {
+          await this.iam.detachUserPolicy({
+            UserName: userName,
+            PolicyArn: policy.PolicyArn!
+          }).promise();
+        } catch (e: any) {
+          // Ignore if policy doesn't exist
+          if (e.code !== 'NoSuchEntity') throw e;
+        }
+      }
+
+      // Delete inline policies
+      const inlinePolicies = await this.iam.listUserPolicies({ UserName: userName }).promise();
+      for (const policyName of inlinePolicies.PolicyNames || []) {
+        try {
+          await this.iam.deleteUserPolicy({
+            UserName: userName,
+            PolicyName: policyName
+          }).promise();
+        } catch (e: any) {
+          // Ignore if policy doesn't exist
+          if (e.code !== 'NoSuchEntity') throw e;
+        }
+      }
+
+      // Delete access keys
+      const accessKeys = await this.iam.listAccessKeys({ UserName: userName }).promise();
+      for (const accessKey of accessKeys.AccessKeyMetadata || []) {
+        try {
+          await this.iam.deleteAccessKey({
+            UserName: userName,
+            AccessKeyId: accessKey.AccessKeyId!
+          }).promise();
+        } catch (e: any) {
+          // Ignore if key doesn't exist
+          if (e.code !== 'NoSuchEntity') throw e;
+        }
+      }
+
+      // Delete the user
+      await this.iam.deleteUser({ UserName: userName }).promise();
+
+      console.log(`[AWSControlTower] IAM user ${userName} deleted successfully`);
+    } catch (error: any) {
+      // If the user doesn't exist, just log and continue
+      if (error.code === 'NoSuchEntity' || error.code === 'ResourceNotFoundException') {
+        console.log(`[AWSControlTower] IAM user ${userName} already deleted or does not exist`);
+        return;
+      }
+      console.error(`[AWSControlTower] Failed to delete IAM user ${userName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get the lab role name based on lab ID
+   * Maps lab IDs to their corresponding IAM role names
+   */
+  private getLabRoleName(labId: string): string {
+    const roleMapping: Record<string, string> = {
+      "lab-1-s3": "Labs-S3-Admin",
+      "lab-2-iam": "Labs-IAM-Admin",
+      "lab-3-ec2": "Labs-EC2-Admin",
+      "lab-4-lambda": "Labs-Lambda-Admin",
+      "lab-5-dynamodb": "Labs-DynamoDB-Admin",
+      "lab-6-cloudtrail": "Labs-CloudTrail-Admin",
+      "lab-7-ssm": "Labs-SSM-Admin",
+    };
+    
+    return roleMapping[labId] || "Labs-Basic-User";
+  }
+
+  /**
+   * Assume role in sandbox account (for management account)
+   */
+  private async assumeRoleInAccount(
+    accountId: string
+  ): Promise<AWS.Credentials> {
+    const sts = new AWS.STS();
+
+    const response = await sts
+      .assumeRole({
+        RoleArn: `arn:aws:iam::${accountId}:role/OrganizationAccountAccessRole`,
+        RoleSessionName: `lab-session-${Date.now()}`,
+        DurationSeconds: 3600,
+      })
+      .promise();
+
+    return new AWS.Credentials({
+      accessKeyId: response.Credentials?.AccessKeyId || "",
+      secretAccessKey: response.Credentials?.SecretAccessKey || "",
+      sessionToken: response.Credentials?.SessionToken,
+    });
+  }
+}
+
+export default new AWSControlTowerService();

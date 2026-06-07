@@ -1,0 +1,233 @@
+import { v4 as uuidv4 } from "uuid";
+import awsControlTowerService, { SandboxAccount } from "./aws-control-tower.service";
+import redisService from "./redis.service";
+
+export interface LabSession {
+  sessionId: string;
+  userId: string;
+  labId: string;
+  purchaseId: string;
+  sandboxAccount: SandboxAccount;
+  startedAt: number;
+  createdAt: number;
+  expiresAt: number;
+  status: "active" | "expired" | "destroyed";
+  terminalPort: number;
+  webSocketUrl: string;
+}
+
+export class LabSessionService {
+  /**
+   * Create a new lab session
+   */
+  async createSession(
+    userId: string,
+    labId: string,
+    purchaseId: string,
+    token: string
+  ): Promise<LabSession> {
+    try {
+      console.log(
+        `[LabSession] Creating session for user ${userId}, lab ${labId}`
+      );
+
+      // Create sandbox AWS account
+      const sandboxAccount = await awsControlTowerService.createSandboxAccount(
+        userId,
+        labId
+      );
+
+      const sessionId = uuidv4();
+      const startedAt = Date.now();
+      const expiresAt =
+        startedAt + (parseInt(process.env.LAB_TIMEOUT_MINUTES || "120") * 60 * 1000);
+
+      // Generate proper WebSocket URL based on environment
+      const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 3001}`;
+      const wsProtocol = backendUrl.startsWith("https") ? "wss" : "ws";
+      const wsHost = backendUrl.replace(/^https?:\/\//, "");
+      const webSocketUrl = `${wsProtocol}://${wsHost}/terminal/${sessionId}`;
+
+      const session: LabSession = {
+        sessionId,
+        userId,
+        labId,
+        purchaseId,
+        sandboxAccount,
+        startedAt,
+        createdAt: Date.now(),
+        expiresAt,
+        status: "active",
+        terminalPort: 3100 + Math.floor(Math.random() * 900),
+        webSocketUrl,
+      };
+
+      // Store session in Redis (shared across all backend instances)
+      const ttlSeconds = Math.ceil((expiresAt - startedAt) / 1000);
+      await redisService.setSession(sessionId, session, ttlSeconds);
+
+      console.log(`[LabSession] Session created: ${sessionId}, expiresAt: ${new Date(expiresAt).toISOString()}, now: ${new Date(startedAt).toISOString()}, redisTTL: ${ttlSeconds}s`);
+      return session;
+    } catch (error) {
+      console.error("[LabSession] Failed to create session:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get active session with grace period for newly created sessions
+   */
+  async getSession(sessionId: string): Promise<LabSession | undefined> {
+    const session = await redisService.getSession(sessionId) as LabSession | null;
+    const now = Date.now();
+    const GRACE_PERIOD_MS = 10000; // 10 second grace period for session initialization
+
+    if (!session) {
+      const allSessionIds = await redisService.getAllSessionIds();
+      console.warn(`[LabSession] Session not found in Redis: ${sessionId}. Active sessions: ${allSessionIds.join(", ") || "none"}`);
+      console.warn(`[LabSession] Total active sessions count: ${allSessionIds.length}`);
+      return undefined;
+    }
+
+    // Allow sessions in grace period even if status is not yet "active"
+    const isInGracePeriod = session.createdAt && (now - session.createdAt) < GRACE_PERIOD_MS;
+    
+    if (session.status !== "active" && !isInGracePeriod) {
+      console.warn(`[LabSession] Session ${sessionId} is not active (status: ${session.status}, created: ${new Date(session.startedAt).toISOString()}, gracePeriod: ${isInGracePeriod})`);
+      return undefined;
+    }
+
+    if (now > session.expiresAt) {
+      console.warn(`[LabSession] Session ${sessionId} has expired. Now: ${new Date(now).toISOString()}, ExpiresAt: ${new Date(session.expiresAt).toISOString()}, diff: ${now - session.expiresAt}ms`);
+      session.status = "expired";
+      await redisService.setSession(sessionId, session, 60); // Keep expired session for 1 minute for cleanup
+      return undefined;
+    }
+
+    // Auto-activate sessions in grace period
+    if (isInGracePeriod && session.status !== "active") {
+      console.log(`[LabSession] Auto-activating session ${sessionId} (in grace period)`);
+      session.status = "active";
+      // Update in Redis
+      const ttlSeconds = Math.ceil((session.expiresAt - now) / 1000);
+      await redisService.setSession(sessionId, session, ttlSeconds);
+    }
+
+    console.log(`[LabSession] Session ${sessionId} validated successfully. Lab: ${session.labId}, expires in ${Math.floor((session.expiresAt - now) / 1000)}s, age: ${now - session.createdAt}ms`);
+    return session;
+  }
+
+  /**
+   * Get list of active session IDs
+   */
+  async getActiveSessionIds(): Promise<string[]> {
+    const allIds = await redisService.getAllSessionIds();
+    const activeIds: string[] = [];
+    const now = Date.now();
+
+    for (const sessionId of allIds) {
+      const session = await redisService.getSession(sessionId) as LabSession | null;
+      if (session && session.status === "active" && now <= session.expiresAt) {
+        activeIds.push(sessionId);
+      }
+    }
+
+    return activeIds;
+  }
+
+  /**
+   * Destroy session
+   */
+  async destroySession(sessionId: string): Promise<void> {
+    try {
+      const session = await redisService.getSession(sessionId) as LabSession | null;
+
+      if (!session) {
+        console.warn(`[LabSession] Session not found in Redis: ${sessionId}`);
+        return;
+      }
+
+      console.log(`[LabSession] Destroying session: ${sessionId}`);
+
+      // Destroy AWS sandbox account
+      await awsControlTowerService.destroySandboxAccount(
+        session.sandboxAccount.accountId,
+        session.sandboxAccount.iamUserName
+      );
+
+      session.status = "destroyed";
+      // Keep destroyed session for 1 minute for reference, then delete
+      await redisService.setSession(sessionId, session, 60);
+      setTimeout(() => redisService.deleteSession(sessionId), 60000);
+
+      console.log(`[LabSession] Session destroyed: ${sessionId}`);
+    } catch (error) {
+      console.error("[LabSession] Failed to destroy session:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Set automatic session expiry - Redis handles TTL automatically
+   * This method is kept for backward compatibility but Redis TTL is primary
+   */
+  private setSessionExpiry(sessionId: string): void {
+    // Redis handles expiry via TTL, but we keep a cleanup check for any orphaned sessions
+    const checkInterval = 300000; // Check every 5 minutes (less frequent since Redis has TTL)
+
+    const timer = setInterval(async () => {
+      const session = await redisService.getSession(sessionId) as LabSession | null;
+
+      if (!session) {
+        clearInterval(timer);
+        return;
+      }
+
+      if (Date.now() > session.expiresAt && session.status === "active") {
+        console.log(`[LabSession] Session expired (cleanup check): ${sessionId}`);
+        await this.destroySession(sessionId);
+        clearInterval(timer);
+      }
+    }, checkInterval);
+  }
+
+  /**
+   * Get all active sessions for a user
+   */
+  async getUserSessions(userId: string): Promise<LabSession[]> {
+    const allIds = await redisService.getAllSessionIds();
+    const userSessions: LabSession[] = [];
+
+    for (const sessionId of allIds) {
+      const session = await redisService.getSession(sessionId) as LabSession | null;
+      if (session && session.userId === userId && session.status === "active") {
+        userSessions.push(session);
+      }
+    }
+
+    return userSessions;
+  }
+
+  /**
+   * Extend session expiry
+   */
+  async extendSession(sessionId: string, additionalMinutes: number = 30): Promise<void> {
+    const session = await redisService.getSession(sessionId) as LabSession | null;
+
+    if (session && session.status === "active") {
+      session.expiresAt += additionalMinutes * 60 * 1000;
+      const newTtlSeconds = Math.ceil((session.expiresAt - Date.now()) / 1000);
+      
+      // Update in Redis with new TTL
+      await redisService.setSession(sessionId, session, newTtlSeconds);
+      
+      console.log(
+        `[LabSession] Session extended: ${sessionId} (new expiry: ${new Date(
+          session.expiresAt
+        ).toISOString()}, new TTL: ${newTtlSeconds}s)`
+      );
+    }
+  }
+}
+
+export default new LabSessionService();

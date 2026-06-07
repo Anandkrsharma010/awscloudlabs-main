@@ -1,0 +1,123 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowLabRoleCreation",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::*:role/Labs-*",
+      "Condition": {
+        "StringLike": {
+          "aws:PrincipalTag/Owner": "lab-admin"
+        }
+      }
+    },
+    {
+      "Sid": "AllowLabUserCreation",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateUser",
+        "iam:DeleteUser",
+        "iam:PutUserPolicy",
+        "iam:DeleteUserPolicy",
+        "iam:AttachUserPolicy",
+        "iam:DetachUserPolicy",
+        "iam:CreateAccessKey",
+        "iam:DeleteAccessKey",
+        "iam:ListAccessKeys"
+      ],
+      "Resource": "arn:aws:iam::*:user/lab-user-*",
+      "Condition": {
+        "StringLike": {
+          "aws:PrincipalTag/Owner": "lab-admin"
+        }
+      }
+    },
+    {
+      "Sid": "AllowLabPolicyManagement",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicy",
+        "iam:DeletePolicy",
+        "iam:GetPolicy",
+        "iam:ListPolicies",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion"
+      ],
+      "Resource": "arn:aws:iam::*:policy/lab-*"
+    },
+    {
+      "Sid": "AllowSTSAssumeRole",
+      "Effect": "Allow",
+      "Action": [
+        "sts:AssumeRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/Labs-S3-Admin",
+        "arn:aws:iam::*:role/Labs-IAM-Admin",
+        "arn:aws:iam::*:role/Labs-EC2-Admin",
+        "arn:aws:iam::*:role/Labs-Lambda-Admin",
+        "arn:aws:iam::*:role/Labs-DynamoDB-Admin",
+        "arn:aws:iam::*:role/Labs-CloudTrail-Admin",
+        "arn:aws:iam::*:role/Labs-SSM-Admin"
+      ]
+    },
+    {
+      "Sid": "AllowLabServices",
+      "Effect": "Allow",
+      "Action": [
+        "s3:*",
+        "ec2:*",
+        "lambda:*",
+        "dynamodb:*",
+        "cloudtrail:*",
+        "ssm:*",
+        "logs:*",
+        "cloudwatch:*"
+      ],
+      "Resource": [
+        "arn:aws:s3:::lab-*",
+        "arn:aws:ec2:*:*:instance/*",
+        "arn:aws:ec2:*:*:security-group/*",
+        "arn:aws:ec2:*:*:vpc/*",
+        "arn:aws:lambda:*:*:function:lab-*",
+        "arn:aws:dynamodb:*:*:table/lab-*",
+        "arn:aws:cloudtrail:*:*:trail/lab-*",
+        "arn:aws:ssm:*:*:document/*"
+      ]
+    },
+    {
+      "Sid": "DenyDestructionOfLabInfrastructure",
+      "Effect": "Deny",
+      "Action": [
+        "iam:DeleteRole",
+        "iam:DeleteUser",
+        "iam:DeletePolicy",
+        "s3:DeleteBucket",
+        "ec2:TerminateInstances",
+        "lambda:DeleteFunction",
+        "dynamodb:DeleteTable"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/Labs-*",
+        "arn:aws:iam::*:user/lab-*",
+        "arn:aws:iam::*:policy/lab-*",
+        "arn:aws:s3:::lab-*",
+        "arn:aws:lambda:*:*:function:lab-*",
+        "arn:aws:dynamodb:*:*:table/lab-*"
+      ],
+      "Condition": {
+        "StringNotEquals": {
+          "aws:PrincipalTag/Owner": "lab-admin"
+        }
+      }
+    }
+  ]
+}
