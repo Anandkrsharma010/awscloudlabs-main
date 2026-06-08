@@ -128,7 +128,8 @@ export class AWSControlTowerService {
     }
     
     // Check if we're in production mode (not development)
-    const isProduction = process.env.NODE_ENV === "production";
+    // Fall back to mock mode if no real AWS access keys are configured
+    const isProduction = process.env.NODE_ENV === "production" && Boolean(process.env.AWS_ACCESS_KEY_ID);
     
     // In production mode without env credentials, try to get credentials from AWS SDK default chain
     if (isProduction) {

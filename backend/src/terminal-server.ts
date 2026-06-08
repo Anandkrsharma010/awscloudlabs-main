@@ -190,7 +190,7 @@ export class TerminalInstance {
   async validateCredentials(): Promise<{ valid: boolean; error?: string }> {
     // Check for DEVKEY - only allow in development mode
     if (this.isTemporaryCredential()) {
-      const isDevMode = process.env.NODE_ENV !== "production";
+      const isDevMode = process.env.NODE_ENV !== "production" || !process.env.AWS_ACCESS_KEY_ID;
       if (isDevMode) {
         console.log(`[Terminal:${this.sessionId}] ✓ Using DEVKEY credentials (development mode)`);
         return { valid: true };
