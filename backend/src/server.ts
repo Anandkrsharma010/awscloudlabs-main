@@ -90,6 +90,16 @@ const HEARTBEAT_INTERVAL = 30000;
 // Socket timeout for upgrade (10 seconds)
 const SOCKET_TIMEOUT = 10000;
 
+// Root landing page
+app.get("/", (req, res) => {
+  res.json({
+    message: "AWS Labs Backend API is running",
+    status: "ok",
+    timestamp: Date.now(),
+    version: "1.0.0"
+  });
+});
+
 // Health check endpoint for AWS App Runner
 app.get("/health", (req, res) => {
   res.json({ 
