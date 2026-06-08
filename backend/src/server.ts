@@ -29,6 +29,8 @@ const PORT = parseInt(process.env.PORT || "3001", 10);
 
 // Dynamic CORS configuration
 const allowedOrigins: string[] = [
+  "https://awscloudlabs-main.vercel.app",
+  "vercel.app",
   "https://ai-chat-two-ecru.vercel.app",
   "https://ai-chat-eor90dxjd-aadhi-netys-projects.vercel.app",
   "https://ai-chat-op8a1ytr0-aadhi-netys-projects.vercel.app",
