@@ -16,14 +16,14 @@ RUN apk add --no-cache \
 
 
 # Copy backend package files
-COPY package*.json ./
-COPY tsconfig.json ./
+COPY backend/package*.json ./
+COPY backend/tsconfig.json ./
 
 # Install dependencies
 RUN npm ci
 
 # Copy source code
-COPY src ./src
+COPY backend/src ./src
 
 # Compile TypeScript
 RUN npm run build
