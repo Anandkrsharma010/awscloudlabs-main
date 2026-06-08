@@ -101,6 +101,25 @@ export class AWSControlTowerService {
     
     console.log(`[AWSControlTower] createSandboxAccount called - NODE_ENV: ${process.env.NODE_ENV}, hasAWSEnvCreds: ${!!(awsAccessKeyId && awsSecretAccessKey)}, AWS_ACCESS_KEY_ID: ${awsAccessKeyId ? awsAccessKeyId.substring(0, 4) + '****' : 'undefined'}`);
     
+    // If AWS credentials are not provided in environment, fall back to mock sandbox immediately
+    // to avoid AWS SDK metadata timeouts (e.g., trying to reach 169.254.169.254 on Render)
+    if (!awsAccessKeyId || !awsSecretAccessKey) {
+      console.log(`[AWSControlTower] No AWS credentials configured. Returning mock DEVKEY sandbox instantly.`);
+      return {
+        accountId: "000000000000",
+        accountName: `lab-${labId}-${userId}-dev`,
+        email: "dev@sandbox.local",
+        iamUserId: "dev-user",
+        iamUserName: "dev-user",
+        iamAccessKeyId: "DEVKEY",
+        iamSecretAccessKey: "DEVSECRET",
+        region: awsRegion,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 2 * 60 * 60 * 1000, // 2 hours
+        status: "active",
+      };
+    }
+
     // If AWS credentials are provided in environment, use them directly
     if (awsAccessKeyId && awsSecretAccessKey) {
       console.log(`[AWSControlTower] Using credentials from environment variables for lab: ${labId}`);
