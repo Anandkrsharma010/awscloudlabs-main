@@ -3,6 +3,7 @@ services:
     name: aws-lab-backend
     env: docker
     dockerfilePath: backend/Dockerfile
+    dockerContext: backend
     plan: free
     envVars:
       - key: PORT
